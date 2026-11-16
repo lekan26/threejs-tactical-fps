@@ -1,13 +1,13 @@
-// Four target dummies: a post, a torso and a head. A head shot kills outright, three torso
-// shots do. A downed dummy falls over, then stands back up four seconds later.
+// Practice targets / dummies near attacker spawn: body box + head box, 100 health,
+// falling over on death, resetting on round restart, clean shoot interface.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
 const SPAWNS = [
-  [-4.6, -9.2],
-  [4.6, -9.2],
-  [0, -7.6],
-  [7.6, -6.2],
+  [-4.6, 16],
+  [4.6, 16],
+  [0, 18],
+  [7.6, 14],
 ];
 const HEALTH = 100;
 const RESPAWN_SECONDS = 4;

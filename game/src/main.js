@@ -1,6 +1,5 @@
-// Boot and the one loop: a fixed 60 Hz simulation feeding a render at the display's rate.
-// ?shot=start|play|end with &seed=N sets up a deterministic frame for a capture, renders it
-// twice, then freezes it and sets window.__shotReady.
+// Main game loop and state integration: fixed 60Hz simulation, raycasting hit detection,
+// weapon switching, economy, rounds, bots, bomb, grenades, audio, and screenshot mode handlers.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { createWorld } from './world.js';
@@ -9,6 +8,13 @@ import { createPlayer } from './player.js';
 import { createWeapon } from './weapon.js';
 import { createTargets } from './targets.js';
 import { createHud } from './hud.js';
+import { gameState } from './state.js';
+import { buyItem, awardKill, awardRoundEnd } from './economy.js';
+import { createBots } from './bots.js';
+import { createBomb } from './bomb.js';
+import { createRoundManager } from './rounds.js';
+import { audio } from './audio.js';
+import { createGrenades } from './grenades.js';
 
 const FIXED_STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
@@ -30,13 +36,10 @@ const random = mulberry32(seed);
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.enabled = false;
 document.getElementById('game').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 18, 46);
 const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.05, 140);
 scene.add(camera);
 
@@ -45,47 +48,72 @@ const targets = createTargets(scene);
 const weapon = createWeapon(camera);
 const hud = createHud();
 const player = createPlayer(world.colliders);
+const bots = createBots(scene, world, player);
+const bomb = createBomb(scene);
+const grenades = createGrenades(scene, world, player, bots, hud, audio);
+const rounds = createRoundManager(player, bots, bomb, hud, weapon);
 const input = createInput(renderer.domElement, onLockChange);
+
+const tracerMat = new THREE.LineBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0.8 });
+const activeTracers = [];
+function addTracer(start, end) {
+  const geom = new THREE.BufferGeometry().setFromPoints([start, end]);
+  const line = new THREE.Line(geom, tracerMat);
+  scene.add(line);
+  activeTracers.push({ line, life: 0.08 });
+}
+function stepTracers(dt) {
+  for (let i = activeTracers.length - 1; i >= 0; i--) {
+    const t = activeTracers[i];
+    t.life -= dt;
+    if (t.life <= 0) {
+      scene.remove(t.line);
+      activeTracers.splice(i, 1);
+    }
+  }
+}
+
 const raycaster = new THREE.Raycaster();
-raycaster.far = 80;
-const shootables = world.shootables.concat(targets.hitMeshes);
-const direction = new THREE.Vector3();
+raycaster.far = 90;
+const shootables = world.shootables.concat(targets.hitMeshes).concat(bots.hitMeshes);
+const shootDir = new THREE.Vector3();
 
 const body = player.state;
 const markerHoldMs = shot ? 4000 : 90;
-let score = 0;
-let elapsed = 0;
-let cleared = false;
-let frozen = false;
-let started = false;
-let accumulator = 0;
-let lastTime = performance.now();
 
-hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-hud.setScore(0);
+hud.setAmmo(weapon.state.current.mag, weapon.state.current.reserve, weapon.state.activeDef.name);
+hud.setStatus(body.health, body.armour, body.money);
+hud.setScores(gameState.attackerScore, gameState.defenderScore);
+hud.setAliveCounts(bots.livingCount('attackers') + (body.health > 0 ? 1 : 0), bots.livingCount('defenders'));
+hud.setTimer(gameState.timer);
+
 hud.onPlay(() => {
   if (shot) return;
-  if (cleared) restart();
+  audio.init();
+  if (gameState.phase === 'matchEnded') {
+    gameState.attackerScore = 0;
+    gameState.defenderScore = 0;
+    rounds.startBuyPhase();
+  }
   input.requestLock();
 });
 
-function restart() {
-  cleared = false;
-  score = 0;
-  elapsed = 0;
-  targets.reset();
-  weapon.refill();
-  hud.setScore(0);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-}
+hud.onBuy((itemId) => {
+  const res = buyItem(itemId, weapon);
+  hud.showBanner(res.message);
+  hud.setStatus(body.health, body.armour, body.money);
+  hud.setAmmo(weapon.state.current.mag, weapon.state.current.reserve, weapon.state.activeDef.name);
+});
 
 function onLockChange(locked) {
   if (shot) return;
   if (locked) {
-    started = true;
+    if (gameState.phase === 'buy' && gameState.timer <= 0) {
+      rounds.startLivePhase();
+    }
     hud.hideOverlay();
-  } else if (!cleared) {
-    hud.showOverlay(started ? 'paused' : 'start', score);
+  } else if (gameState.phase !== 'matchEnded') {
+    hud.showOverlay(gameState.phase === 'live' ? 'paused' : 'start');
   }
 }
 
@@ -104,39 +132,154 @@ function aimAt(point) {
   syncCamera();
 }
 
-function shoot(spread) {
+function shoot(spreadVal) {
+  if (!weapon.ready()) return false;
   if (!weapon.takeRound()) return false;
-  camera.getWorldDirection(direction);
-  direction.x += (random() * 2 - 1) * spread;
-  direction.y += (random() * 2 - 1) * spread;
-  direction.z += (random() * 2 - 1) * spread;
-  direction.normalize();
+
+  audio.playShot(weapon.state.activeDef.name);
+
+  camera.getWorldDirection(shootDir);
+  const startPos = camera.position.clone();
+  shootDir.x += (random() * 2 - 1) * spreadVal;
+  shootDir.y += (random() * 2 - 1) * spreadVal;
+  shootDir.z += (random() * 2 - 1) * spreadVal;
+  shootDir.normalize();
+
   scene.updateMatrixWorld(true);
-  raycaster.set(camera.position, direction);
+  raycaster.set(camera.position, shootDir);
   const hit = raycaster.intersectObjects(shootables, false)[0];
-  if (hit && hit.object.userData.target) {
-    const killed = targets.damage(hit.object, hit.object.userData.part === 'head' ? 100 : 34);
-    score += killed ? 100 : 10;
-    hud.setScore(score);
-    hud.hitMarker(killed, markerHoldMs);
-    if (targets.remaining() === 0 && !cleared) {
-      cleared = true;
-      hud.showOverlay('end', score);
-      if (document.pointerLockElement) document.exitPointerLock();
+
+  const endPos = hit ? hit.point.clone() : camera.position.clone().addScaledVector(shootDir, 80);
+  addTracer(startPos, endPos);
+
+  if (hit) {
+    const isHead = hit.object.userData.part === 'head';
+    const def = weapon.state.activeDef;
+    const dmg = isHead ? def.headDmg : def.bodyDmg;
+
+    if (hit.object.userData.target) {
+      const killed = targets.damage(hit.object, dmg);
+      if (killed) {
+        awardKill();
+        audio.playKill();
+        hud.addKillFeed(`Player eliminated target (${isHead ? 'HEADSHOT' : 'BODY'})`);
+      } else {
+        audio.playHitmarker();
+      }
+      hud.hitMarker(killed, markerHoldMs);
+    } else if (hit.object.userData.bot) {
+      const killed = bots.damageBot(hit.object, dmg);
+      if (killed) {
+        awardKill();
+        audio.playKill();
+        hud.addKillFeed(`Player eliminated bot (${isHead ? 'HEADSHOT' : 'BODY'})`);
+      } else {
+        audio.playHitmarker();
+      }
+      hud.hitMarker(killed, markerHoldMs);
     }
+    hud.setStatus(body.health, body.armour, body.money);
   }
+
+  bots.alertBotsToSound(body.position, 25);
+
   weapon.pullTrigger();
-  player.recoil(0.009 + random() * 0.004, (random() * 2 - 1) * 0.004);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
+  player.recoil(weapon.state.activeDef.recoilKick * 0.2 + random() * 0.003, (random() * 2 - 1) * 0.003);
+  hud.setAmmo(weapon.state.current.mag, weapon.state.current.reserve, weapon.state.activeDef.name);
   return true;
 }
 
+let footstepTimer = 0;
+
 function step(dt) {
-  elapsed += dt;
-  player.step(dt, input.state.keys);
-  weapon.step(dt);
-  targets.step(dt, elapsed);
+  rounds.step(dt);
+  bomb.step(dt, body.position, input.state.keys, true);
+  bots.step(dt, performance.now() / 1000, body.position, world.colliders, grenades);
+  grenades.step(dt, body.position, world.colliders);
+  stepTracers(dt);
+
+  const speed = player.groundSpeed();
+  if (speed > 1.0 && body.onGround) {
+    footstepTimer += dt;
+    if (footstepTimer >= 0.4) {
+      audio.playFootstep();
+      footstepTimer = 0;
+    }
+  }
+
+  const events = input.consumeEvents();
+  for (const ev of events) {
+    if (ev === 'Digit1') weapon.selectSlot('primary');
+    if (ev === 'Digit2') weapon.selectSlot('sidearm');
+    if (ev === 'KeyR') {
+      weapon.reload();
+      audio.playReload();
+    }
+    if (ev === 'KeyB') {
+      if (gameState.phase === 'buy') {
+        const overlayEl = document.getElementById('overlay');
+        if (overlayEl.hidden) hud.showOverlay('start');
+        else hud.hideOverlay();
+      }
+    }
+    if (ev === 'Digit3') buyItem('frag', weapon);
+    if (ev === 'Digit4') {
+      if (gameState.player.hasFrag) {
+        grenades.throwGrenade('frag', camera, gameState.player);
+      } else if (gameState.player.hasSmoke) {
+        grenades.throwGrenade('smoke', camera, gameState.player);
+      } else {
+        hud.showBanner('No grenades carried. Buy in shop (B).');
+      }
+    }
+  }
+
+  const def = weapon.state.activeDef;
+  const spread = weapon.spread(speed, body.crouching, input.state.ads);
+  hud.setCrosshairSpread(spread);
+  hud.showDmrScope(def.isDmr && input.state.ads);
+
+  if (gameState.phase !== 'buy') {
+    player.step(dt, input.state.keys);
+  }
+  weapon.step(dt, input.state.ads);
+  targets.step(dt, performance.now() / 1000);
+
+  const targetFov = input.state.ads ? def.adsFov : 74;
+  camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 16);
+  camera.updateProjectionMatrix();
+
+  hud.setTimer(gameState.timer);
+  hud.setStatus(body.health, body.armour, body.money);
+  hud.setAmmo(weapon.state.current.mag, weapon.state.current.reserve, def.name);
+  hud.setAliveCounts(bots.livingCount('attackers') + (body.health > 0 ? 1 : 0), bots.livingCount('defenders'));
+
+  if (bomb.state.planted) {
+    hud.setBombStatus(`BOMB PLANTED (${Math.ceil(bomb.state.timer)}s) - DEFUSE WITH E`);
+    if (Math.random() < 0.05) audio.playBeep(1 + (45 - bomb.state.timer) * 0.05);
+  } else if (bomb.state.plantProgress > 0) {
+    hud.setBombStatus(`PLANTING... ${Math.round(bomb.state.plantProgress * 33)}%`);
+  } else {
+    hud.setBombStatus('');
+  }
+
+  if (input.state.firing && weapon.ready() && gameState.phase === 'live') {
+    if (def.automatic || input.consumeEvents().includes('MouseDown')) {
+      shoot(shot ? 0 : spread);
+    } else {
+      shoot(shot ? 0 : spread);
+      input.state.firing = false;
+    }
+  }
+
+  if (body.health <= 0 && gameState.phase === 'live') {
+    audio.playLoss();
+    rounds.endRound('defenders', 'Attacker eliminated');
+  }
 }
+
+let lastTime = performance.now();
+let accumulator = 0;
 
 function frame(now) {
   requestAnimationFrame(frame);
@@ -145,8 +288,7 @@ function frame(now) {
   if (!frozen) {
     const look = input.takeLook();
     player.look(look.x, look.y);
-    if (input.state.firing && weapon.ready()) shoot(shot ? 0 : weapon.spread(player.groundSpeed()));
-    if (input.state.keys.has('KeyR')) weapon.reload();
+
     accumulator += dt;
     let steps = 0;
     while (accumulator >= FIXED_STEP && steps < 5) {
@@ -160,6 +302,8 @@ function frame(now) {
   renderer.render(scene, camera);
 }
 
+let frozen = false;
+
 function settle(steps) {
   for (let index = 0; index < steps; index += 1) step(FIXED_STEP);
 }
@@ -168,34 +312,42 @@ function runShot(name) {
   hud.hideOverlay();
   body.pitch = 0;
   body.yaw = 0;
-  if (name === 'play' || name === 'end') {
-    body.position.set(0, 0, -5);
+  if (name === 'play') {
+    body.position.set(-14, 0, 5);
     settle(20);
-    const count = name === 'play' ? 1 : targets.items.length;
-    for (let index = 0; index < count; index += 1) {
-      const point = targets.aimPoint(index);
-      for (let round = 0; round < 3; round += 1) {
-        aimAt(point);
-        shoot(0);
-        if (round < 2) settle(8);
-      }
-    }
-    if (name === 'play') {
-      settle(12);
-      aimAt(targets.aimPoint(1));
-      shoot(0);
-      settle(1);
-    } else {
-      settle(40);
-    }
+    aimAt(new THREE.Vector3(-14, 1.0, -10));
+    addTracer(camera.position, new THREE.Vector3(-14, 1.0, -15));
+    shoot(0);
+    settle(10);
+  } else if (name === 'end') {
+    gameState.phase = 'matchEnded';
+    gameState.attackerScore = 5;
+    hud.setScores(5, 0);
+    body.position.set(0, 0, 10);
+    settle(20);
+    aimAt(new THREE.Vector3(0, 1.5, -4));
+    hud.showOverlay('end', 'ATTACKERS WIN THE MATCH! Click restart.');
+  } else if (name === 'buy') {
+    body.position.set(0, 0, 24);
+    settle(20);
+    aimAt(new THREE.Vector3(0, 1.5, 0));
+    rounds.startBuyPhase();
+    hud.showOverlay('buy');
+  } else if (name === 'start') {
+    body.position.set(0, 0, 24);
+    settle(20);
+    aimAt(new THREE.Vector3(0, 1.5, 0));
+    rounds.startBuyPhase();
+    hud.showOverlay('start');
   } else {
-    body.position.set(0.6, 0, 8.6);
+    body.position.set(0, 0, 24);
     settle(20);
-    aimAt(new THREE.Vector3(0, 1.5, -6));
-    hud.showOverlay('start', 0);
+    aimAt(new THREE.Vector3(0, 1.5, 0));
+    rounds.startBuyPhase();
+    hud.showOverlay('buy');
   }
-  hud.setScore(score);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
+  hud.setStatus(body.health, body.armour, body.money);
+  hud.setAmmo(weapon.state.current.mag, weapon.state.current.reserve, weapon.state.activeDef.name);
   paintTwiceThenReady();
 }
 
@@ -221,5 +373,9 @@ window.addEventListener('resize', () => {
 });
 
 syncCamera();
-if (shot) runShot(shot);
-else requestAnimationFrame(frame);
+if (shot) {
+  runShot(shot);
+} else {
+  rounds.startBuyPhase();
+  requestAnimationFrame(frame);
+}

@@ -1,5 +1,5 @@
-// Player movement: acceleration, friction, gravity, crouch and jump, resolved as a box against
-// the world's colliders one axis at a time, so a wall never swallows the player.
+// Player movement and collision: WASD, Shift (walk/steady), Crouch, Jump,
+// acceleration, friction, gravity, capsule collision against world colliders.
 import * as THREE from 'three';
 
 const RADIUS = 0.34;
@@ -7,17 +7,18 @@ const STAND_HEIGHT = 1.72;
 const CROUCH_HEIGHT = 1.12;
 const STAND_EYE = 1.6;
 const CROUCH_EYE = 1.02;
-const WALK_SPEED = 5.2;
-const CROUCH_SPEED = 2.4;
-const GROUND_ACCEL = 42;
-const AIR_ACCEL = 9;
-const FRICTION = 9;
-const GRAVITY = 20;
-const JUMP_SPEED = 6.2;
+const WALK_SPEED = 4.2;
+const SHIFT_SPEED = 2.6;
+const CROUCH_SPEED = 2.2;
+const GROUND_ACCEL = 40;
+const AIR_ACCEL = 8;
+const FRICTION = 10;
+const GRAVITY = 22;
+const JUMP_SPEED = 6.0;
 
 export function createPlayer(colliders) {
   const player = {
-    position: new THREE.Vector3(0, 0, 9.5),
+    position: new THREE.Vector3(0, 0, 24), // Attacker spawn area (Z: 24)
     velocity: new THREE.Vector3(),
     yaw: 0,
     pitch: 0,
@@ -25,12 +26,13 @@ export function createPlayer(colliders) {
     onGround: true,
     crouching: false,
     height: STAND_HEIGHT,
+    health: 100,
+    armour: 0,
+    money: 800,
   };
   const probe = new THREE.Box3();
   const wish = new THREE.Vector3();
 
-  // lift keeps the feet and the crown out of the horizontal tests, so standing on the floor
-  // is not read as walking into a wall.
   function overlaps(x, y, z, height, lift) {
     probe.min.set(x - RADIUS, y + lift, z - RADIUS);
     probe.max.set(x + RADIUS, y + height - lift, z + RADIUS);
@@ -69,7 +71,10 @@ export function createPlayer(colliders) {
       wish.set(-sin * forward + cos * strafe, 0, -cos * forward - sin * strafe).normalize();
     }
 
-    const speed = player.crouching ? CROUCH_SPEED : WALK_SPEED;
+    let speed = WALK_SPEED;
+    if (player.crouching) speed = CROUCH_SPEED;
+    else if (keys.has('ShiftLeft') || keys.has('ShiftRight')) speed = SHIFT_SPEED;
+
     const blend = Math.min(1, (player.onGround ? GROUND_ACCEL : AIR_ACCEL) * dt / speed);
     player.velocity.x += (wish.x * speed - player.velocity.x) * blend;
     player.velocity.z += (wish.z * speed - player.velocity.z) * blend;
@@ -79,7 +84,7 @@ export function createPlayer(colliders) {
       player.velocity.z *= damp;
     }
 
-    if (keys.has('Space') && player.onGround) {
+    if (keys.has('Space') && player.onGround && !player.crouching) {
       player.velocity.y = JUMP_SPEED;
       player.onGround = false;
     }
@@ -119,5 +124,14 @@ export function createPlayer(colliders) {
     groundSpeed() {
       return Math.hypot(player.velocity.x, player.velocity.z);
     },
+    reset(spawnPos = new THREE.Vector3(0, 0, 24)) {
+      player.position.copy(spawnPos);
+      player.velocity.set(0, 0, 0);
+      player.health = 100;
+      player.armour = 0;
+      player.crouching = false;
+      player.height = STAND_HEIGHT;
+      player.eye = STAND_EYE;
+    }
   };
 }
