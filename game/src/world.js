@@ -147,10 +147,6 @@ export function createWorld(scene) {
   box(0.2, 0.2, 8.0, 20.6, 4.0, 15, 'canvas', lampMaterial);
 
   // Additional emissive lamp strips along lanes and over bomb sites
-  box(0.2, 0.2, 14.0, 0, 4.5, -10, 'canvas', lampMaterial);
-  box(0.2, 0.2, 14.0, 0, 4.5, 10, 'canvas', lampMaterial);
-  box(0.2, 0.2, 12.0, -14, 4.5, 0, 'canvas', lampMaterial);
-  box(0.2, 0.2, 12.0, 14, 4.5, 0, 'canvas', lampMaterial);
   box(4.2, 0.2, 0.2, -16, 0.2, -28, 'canvas', lampMaterial);
   box(0.2, 0.2, 4.2, -18, 0.2, -26, 'canvas', lampMaterial);
   box(4.2, 0.2, 0.2, 16, 0.2, -28, 'canvas', lampMaterial);
